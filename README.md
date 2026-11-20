@@ -26,7 +26,7 @@ El simulador modela en tiempo discreto ($dt = 10\text{ ms}$) el lazo cerrado del
 
 ### Opción A: Acceso directo vía Web (Recomendado para evaluación)
 1. Ingresar al enlace del **Tablero de Control Interactivo** indicado en la sección anterior desde cualquier navegador web.
-2. Utilizar el panel lateral izquierdo (**Parámetros de Operación**) para ajustar las variables del sistema y observar la actualización instantánea de las métricas y gráficas de respuesta temporal ($\theta_o(t)$, $e(t)$ y $u(t)$).
+2. Utilizar el panel lateral izquierdo (**Parámetros de Operación**) para ajustar las variables del sistema y observar la actualización instantánea de las métricas y gráficas de respuesta temporal ($\theta_o(t)$, $e(t)$ y u(t)).
 
 ### Opción B: Ejecución en entorno local
 1. Clonar el repositorio o descargar los archivos fuente:

@@ -42,36 +42,37 @@ st.markdown("""
     color: #475569;
 }
 
-/* Tarjetas de métricas compactas con alto contraste (números en negro) */
-div[data-testid="stMetric"] {
-    background-color: #f8fafc !important;
-    border: 1px solid #cbd5e1 !important;
+/* Tarjetas de métricas compactas con alto contraste garantizado (números en negro puro) */
+.metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-bottom: 8px;
+}
+.metric-card {
+    background-color: #ffffff;
+    border: 1px solid #cbd5e1;
     border-radius: 6px;
-    padding: 6px 10px !important;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+    padding: 8px 12px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
-div[data-testid="stMetricValue"],
-div[data-testid="stMetricValue"] > div,
-div[data-testid="stMetricValue"] * {
-    color: #000000 !important;
-    font-size: 1.12rem !important;
-    font-weight: 700 !important;
-    line-height: 1.2 !important;
-}
-div[data-testid="stMetricLabel"],
-div[data-testid="stMetricLabel"] > div,
-div[data-testid="stMetricLabel"] * {
-    font-size: 0.74rem !important;
-    font-weight: 600 !important;
+.metric-label {
+    font-size: 0.76rem;
+    font-weight: 600;
     color: #334155 !important;
-    margin-bottom: 0px !important;
+    margin-bottom: 2px;
 }
-div[data-testid="stMetricDelta"] {
-    font-size: 0.68rem !important;
-    margin-top: 0px !important;
+.metric-value {
+    font-size: 1.22rem;
+    font-weight: 800;
+    color: #000000 !important;
+    line-height: 1.25;
 }
-div[data-testid="stMetricDelta"] svg {
-    display: inline-block;
+.metric-delta {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: #334155 !important;
+    margin-top: 2px;
 }
 
 /* Reducir espacio entre elementos */
@@ -84,7 +85,6 @@ div[data-testid="stVerticalBlock"] > div {
 # --- CONSTANTES FÍSICAS DEL SISTEMA (VW Golf VII - SSP 516) ---
 L_wb = 2.637          # Distancia entre ejes VW Golf VII [m]
 tau_act = 0.08        # Constante de tiempo actuador EPS J500 + V187 [s]
-banda_muerta = 0.08   # Banda muerta nominal [m]
 torque_max = 2.5      # Saturación par EPS [Nm]
 tau_cam = 0.04        # Retardo cámara R242 [s]
 
@@ -107,6 +107,8 @@ VALORES_CASO_1 = {
     "Kp": 1.8,
     "Ki": 0.25,
     "Kd": 1.1,
+    "banda_muerta": 0.08,
+    "T_total": 10.0,
 }
 
 # Inicializar session_state si no existe o si cambió de versión
@@ -194,12 +196,22 @@ amp_slider = st.sidebar.slider(
 )
 
 es_peralte = (tipo_pert == "Peralte o pendiente transversal de la calzada")
+t_total_actual = float(st.session_state["T_total"])
+st.session_state["t_inicio"] = float(min(st.session_state["t_inicio"], t_total_actual - 0.5))
+st.session_state["t_fin"] = float(min(st.session_state["t_fin"], t_total_actual))
+
 col_t1, col_t2 = st.sidebar.columns(2)
-t_inicio = col_t1.number_input("t inicio [s]", min_value=0.0, max_value=9.5, step=0.5, key="t_inicio")
+t_inicio = col_t1.number_input(
+    "t inicio [s]",
+    min_value=0.0,
+    max_value=t_total_actual - 0.5,
+    step=0.5,
+    key="t_inicio"
+)
 t_fin = col_t2.number_input(
     "t fin [s]",
     min_value=0.5,
-    max_value=10.0,
+    max_value=t_total_actual,
     step=0.5,
     key="t_fin",
     disabled=es_peralte
@@ -209,6 +221,23 @@ st.sidebar.subheader("Sintonización PID")
 Kp = st.sidebar.number_input("Kp [Nm/m]", min_value=0.0, max_value=20.0, step=0.1, key="Kp")
 Ki = st.sidebar.number_input("Ki [Nm/(m·s)]", min_value=0.0, max_value=10.0, step=0.05, key="Ki")
 Kd = st.sidebar.number_input("Kd [Nm·s/m]", min_value=0.0, max_value=10.0, step=0.1, key="Kd")
+
+st.sidebar.subheader("Restricciones y Horizonte Temporal")
+banda_muerta = st.sidebar.number_input(
+    "Banda muerta [m] (0.00 = modelo lineal ideal)",
+    min_value=0.0,
+    max_value=0.20,
+    step=0.01,
+    format="%.2f",
+    key="banda_muerta"
+)
+T_total = st.sidebar.number_input(
+    "Horizonte temporal T_total [s]",
+    min_value=5.0,
+    max_value=40.0,
+    step=5.0,
+    key="T_total"
+)
 
 # Opciones de visualización y animación en la barra lateral
 st.sidebar.subheader("Visualización y Evolución Temporal")
@@ -241,7 +270,6 @@ pos_leyenda = st.sidebar.selectbox(
 
 # --- MODELO FÍSICO Y SIMULACIÓN ---
 dt = 0.01          # Paso de integración: 10 ms
-T_total = 10.0     # Tiempo total simulado: 10 s
 t = np.arange(0, T_total, dt)
 n = len(t)
 
@@ -287,6 +315,7 @@ for k in range(delay_steps, n - 1):
 
     if abs_e <= banda_muerta:
         u_raw = 0.0
+        integral_e = 0.0
     else:
         integral_e += e[k] * dt
         derivada_e = (e[k] - error_prev) / dt
@@ -331,32 +360,50 @@ def render_metrics(idx_end: int):
     torque_pico = float(np.max(np.abs(u_seg)))
     en_carril = desvio_max < 0.30
 
-    with metrics_placeholder.container():
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric(
-            "Desvío Lateral Máximo",
-            f"{desvio_max:.3f} m",
-            delta="Límite: ±0.30 m",
-            delta_color="off"
-        )
-        col2.metric(
-            "Error Actual / Estable (e)" if idx_end < n else "Error Estado Estable (ess)",
-            f"{ess_actual:.4f} m",
-            delta=f"t = {t_actual:.2f} s | Ref: 0.00 m",
-            delta_color="off"
-        )
-        col3.metric(
-            "Torque Máximo Aplicado",
-            f"{torque_pico:.2f} Nm",
-            delta=f"Tope: ±{torque_max:.1f} Nm",
-            delta_color="off"
-        )
-        col4.metric(
-            "Estado del Lazo",
-            "ESTABLE (En carril)" if en_carril else "CRÍTICO (Pisa línea)",
-            delta="Dentro de carril" if en_carril else "Excede límite",
-            delta_color="normal" if en_carril else "inverse"
-        )
+    if len(y_seg) > 1:
+        variacion_final = float(np.max(np.abs(np.diff(y_seg[-min(50, len(y_seg)):]))))
+    else:
+        variacion_final = float("inf")
+
+    if idx_end == n and variacion_final < 0.0005:
+        titulo_error = "Error Estado Estable (ess)"
+        delta_error = f"Estabilizado en t = {t_actual:.1f} s"
+    else:
+        titulo_error = "Error Instantáneo e(t)"
+        delta_error = f"En transitorio (t = {t_actual:.1f} s)"
+
+    estado_texto = "ESTABLE (En carril)" if en_carril else "CRÍTICO (Pisa línea)"
+    estado_delta = "Dentro de carril" if en_carril else "Excede límite"
+    estado_delta_color = "#15803d" if en_carril else "#b91c1c"
+    estado_val_color = "#000000" if en_carril else "#991b1b"
+
+    metrics_placeholder.markdown(
+        f"""
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-label">Desvío Lateral Máximo</div>
+                <div class="metric-value" style="color:#000000 !important;">{desvio_max:.3f} m</div>
+                <div class="metric-delta" style="color:#334155 !important;">Límite: ±0.30 m</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">{titulo_error}</div>
+                <div class="metric-value" style="color:#000000 !important;">{ess_actual:.4f} m</div>
+                <div class="metric-delta" style="color:#334155 !important;">{delta_error}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Torque Máximo Aplicado</div>
+                <div class="metric-value" style="color:#000000 !important;">{torque_pico:.2f} Nm</div>
+                <div class="metric-delta" style="color:#334155 !important;">Tope: ±{torque_max:.1f} Nm</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Estado del Lazo</div>
+                <div class="metric-value" style="color:{estado_val_color} !important;">{estado_texto}</div>
+                <div class="metric-delta" style="color:{estado_delta_color} !important; font-weight:600;">{estado_delta}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 
 # --- CONFIGURACIÓN BASE DE GRÁFICAS (ejes fijos para evolución suave) ---
@@ -399,6 +446,30 @@ axs[2].set_ylabel('Torque / Pert.', fontsize=8.5, fontweight='bold')
 axs[2].set_xlabel('Tiempo [s]', fontsize=8.5, fontweight='bold')
 axs[2].tick_params(labelsize=8)
 axs[2].grid(True, alpha=0.35, linestyle='--')
+
+# Referencias visuales y marcas en el eje X para t_inicio y t_fin
+refs_tiempo = [t_inicio] if es_peralte else [t_inicio, t_fin]
+for ax in axs:
+    ax.axvline(t_inicio, color='#ff7f0e', linestyle=':', linewidth=0.9, alpha=0.55)
+    if not es_peralte:
+        ax.axvline(t_fin, color='#ff7f0e', linestyle=':', linewidth=0.9, alpha=0.55)
+
+if T_total <= 10.0:
+    tick_step = 1.0
+elif T_total <= 20.0:
+    tick_step = 2.0
+else:
+    tick_step = 5.0
+base_ticks = list(np.arange(0.0, T_total + 1e-9, tick_step))
+min_gap = T_total * 0.035
+valid_refs = [float(rv) for rv in refs_tiempo if 0.0 <= rv <= T_total]
+x_ticks = [bt for bt in base_ticks if all(abs(bt - rv) >= min_gap for rv in valid_refs)]
+for rv in valid_refs:
+    if all(abs(rv - tv) >= 1e-6 for tv in x_ticks):
+        x_ticks.append(rv)
+x_ticks.sort()
+axs[2].set_xticks(x_ticks)
+axs[2].set_xticklabels([f"{tv:g}" for tv in x_ticks])
 
 # Configuración de referencias (leyendas) para no tapar los datos
 if pos_leyenda == "Exterior derecha (no tapa gráficos)":
@@ -450,12 +521,13 @@ def render_frame(idx_end: int, mostrar_cursor: bool):
 
 if animar_evolucion:
     config_vel = {
-        "Muy lenta": (20, 0.18),
-        "Lenta": (25, 0.10),
-        "Normal": (35, 0.04),
-        "Rápida": (50, 0.01),
+        "Muy lenta": (50, 0.18),
+        "Lenta": (40, 0.10),
+        "Normal": (28, 0.04),
+        "Rápida": (20, 0.01),
     }
-    paso_muestras, pausa_seg = config_vel[velocidad_anim]
+    num_frames, pausa_seg = config_vel[velocidad_anim]
+    paso_muestras = max(1, n // num_frames)
     frames = list(range(paso_muestras, n, paso_muestras))
     if not frames or frames[-1] != n:
         frames.append(n)

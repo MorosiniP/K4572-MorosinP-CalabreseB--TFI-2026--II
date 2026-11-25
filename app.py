@@ -1,4 +1,5 @@
 import time
+from collections import deque
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
@@ -196,29 +197,25 @@ amp_slider = st.sidebar.slider(
 )
 
 es_peralte = (tipo_pert == "Peralte o pendiente transversal de la calzada")
-t_total_actual = float(st.session_state["T_total"])
-st.session_state["t_inicio"] = float(min(st.session_state["t_inicio"], t_total_actual - 0.5))
-st.session_state["t_fin"] = float(min(st.session_state["t_fin"], t_total_actual))
-
 col_t1, col_t2 = st.sidebar.columns(2)
 t_inicio = col_t1.number_input(
     "t inicio [s]",
     min_value=0.0,
-    max_value=t_total_actual - 0.5,
     step=0.5,
     key="t_inicio"
 )
 t_fin = col_t2.number_input(
     "t fin [s]",
-    min_value=0.5,
-    max_value=t_total_actual,
+    min_value=0.1,
     step=0.5,
     key="t_fin",
     disabled=es_peralte
 )
 
 st.sidebar.subheader("Sintonización PID")
-Kp = st.sidebar.number_input("Kp [Nm/m]", min_value=0.0, max_value=20.0, step=0.1, key="Kp")
+Kp1 = st.sidebar.number_input("Kp Nominal [Nm/m]", min_value=0.0, max_value=20.0, step=0.1, key="Kp1")
+Kp2 = st.sidebar.number_input("Kp Moderado [Nm/m]", min_value=0.0, max_value=20.0, step=0.1, key="Kp2")
+Kp3 = st.sidebar.number_input("Kp Intenso [Nm/m]", min_value=0.0, max_value=20.0, step=0.1, key="Kp3")
 Ki = st.sidebar.number_input("Ki [Nm/(m·s)]", min_value=0.0, max_value=10.0, step=0.05, key="Ki")
 Kd = st.sidebar.number_input("Kd [Nm·s/m]", min_value=0.0, max_value=10.0, step=0.1, key="Kd")
 
@@ -231,8 +228,9 @@ banda_muerta = st.sidebar.number_input(
     format="%.2f",
     key="banda_muerta"
 )
+simulacion_infinita = st.sidebar.checkbox("Simulación infinita (continua)", value=True)
 T_total = st.sidebar.number_input(
-    "Horizonte temporal T_total [s]",
+    "Ventana de tiempo visible [s]" if simulacion_infinita else "Horizonte temporal T_total [s]",
     min_value=5.0,
     max_value=40.0,
     step=5.0,
@@ -241,14 +239,18 @@ T_total = st.sidebar.number_input(
 
 # Opciones de visualización y animación en la barra lateral
 st.sidebar.subheader("Visualización y Evolución Temporal")
-animar_evolucion = st.sidebar.checkbox("Animar evolución en el tiempo", value=True)
+animar_evolucion = st.sidebar.checkbox(
+    "Animar evolución en el tiempo",
+    value=True,
+    disabled=simulacion_infinita
+)
 velocidad_anim = st.sidebar.select_slider(
     "Velocidad de evolución:",
     options=["Muy lenta", "Lenta", "Normal", "Rápida"],
     value="Lenta",
-    disabled=not animar_evolucion
+    disabled=not (animar_evolucion or simulacion_infinita)
 )
-st.sidebar.button("▶️ Reproducir evolución", use_container_width=True)
+st.sidebar.button("▶️ Reiniciar desde t = 0" if simulacion_infinita else "▶️ Reproducir evolución", use_container_width=True)
 
 tamano_graf = st.sidebar.radio(
     "Escala de gráficas:",
@@ -270,71 +272,109 @@ pos_leyenda = st.sidebar.selectbox(
 
 # --- MODELO FÍSICO Y SIMULACIÓN ---
 dt = 0.01          # Paso de integración: 10 ms
-t = np.arange(0, T_total, dt)
-n = len(t)
-
-r = np.zeros(n)
-y = np.zeros(n)
-psi = np.zeros(n)
-delta = np.zeros(n)
-e = np.zeros(n)
-u = np.zeros(n)
-perturbacion = np.zeros(n)
-
+delay_steps = int(round(tau_cam / dt))
 t_fin_eff = max(t_fin, t_inicio + 0.1)
+dur_pert = t_fin_eff - t_inicio
+rng_asfalto = np.random.default_rng(42)
 
-if tipo_pert == "Viento lateral (Crosswinds)":
-    perturbacion[(t >= t_inicio) & (t <= t_fin_eff)] = amp_pert
-elif tipo_pert == "Peralte o pendiente transversal de la calzada":
-    perturbacion[t >= t_inicio] = amp_pert
-elif tipo_pert == "Irregularidades del asfalto":
-    mask = (t >= t_inicio) & (t <= t_fin_eff)
-    tm = t[mask] - t_inicio
-    rng = np.random.default_rng(42)
-    perfil_baches = (
-        0.65
-        + 0.50 * np.sin(2.0 * np.pi * 1.6 * tm)
-        + 0.35 * np.sin(2.0 * np.pi * 4.2 * tm)
-        + 0.25 * rng.normal(0.0, 1.0, size=mask.sum())
-    )
-    perturbacion[mask] = amp_pert * perfil_baches
-elif tipo_pert == "Intervención del conductor":
-    mask = (t >= t_inicio) & (t <= t_fin_eff)
-    tm = t[mask] - t_inicio
-    dur = t_fin_eff - t_inicio
-    perturbacion[mask] = amp_pert * 1.25 * np.sin(np.pi * tm / dur)
+# Buffers acotados a la ventana visible para mantener memoria constante y render fluido
+buf_len = int(round(T_total / dt)) + 20
+t_buf = deque(maxlen=buf_len)
+y_buf = deque(maxlen=buf_len)
+e_buf = deque(maxlen=buf_len)
+u_buf = deque(maxlen=buf_len)
+p_buf = deque(maxlen=buf_len)
+y_delay_buf = deque([0.0] * (delay_steps + 1), maxlen=delay_steps + 1)
 
+# Estado dinámico del sistema
+k_step = 0
+y_k = 0.0
+psi_k = 0.0
+delta_k = 0.0
 integral_e = 0.0
 error_prev = 0.0
-delay_steps = int(round(tau_cam / dt))
+desvio_max = 0.0
+torque_pico = 0.0
 
-for k in range(delay_steps, n - 1):
-    y_medido = y[k - delay_steps]
-    e[k] = r[k] - y_medido
-    abs_e = abs(e[k])
 
-    if abs_e <= banda_muerta:
-        u_raw = 0.0
-        integral_e = 0.0
+def calcular_perturbacion(t_actual: float) -> float:
+    if tipo_pert == "Viento lateral (Crosswinds)":
+        return amp_pert if (t_inicio <= t_actual <= t_fin_eff) else 0.0
+    if tipo_pert == "Peralte o pendiente transversal de la calzada":
+        return amp_pert if (t_actual >= t_inicio) else 0.0
+    if tipo_pert == "Irregularidades del asfalto":
+        if t_inicio <= t_actual <= t_fin_eff:
+            tm = t_actual - t_inicio
+            perfil = (
+                0.65
+                + 0.50 * np.sin(2.0 * np.pi * 1.6 * tm)
+                + 0.35 * np.sin(2.0 * np.pi * 4.2 * tm)
+                + 0.25 * float(rng_asfalto.normal(0.0, 1.0))
+            )
+            return amp_pert * perfil
+        return 0.0
+    if tipo_pert == "Intervención del conductor":
+        if t_inicio <= t_actual <= t_fin_eff:
+            tm = t_actual - t_inicio
+            return amp_pert * 1.25 * float(np.sin(np.pi * tm / dur_pert))
+        return 0.0
+    return 0.0
+
+
+def avanzar_paso():
+    global k_step, y_k, psi_k, delta_k, integral_e, error_prev, desvio_max, torque_pico
+
+    t_k = k_step * dt
+    p_k = calcular_perturbacion(t_k)
+
+    if k_step < delay_steps:
+        e_k = 0.0
+        u_k = 0.0
     else:
-        integral_e += e[k] * dt
-        derivada_e = (e[k] - error_prev) / dt
-        u_raw = Kp * e[k] + Ki * integral_e + Kd * derivada_e
+        y_medido = y_delay_buf[0]
+        e_k = 0.0 - y_medido  # Referencia r(t) = 0.0 m
 
-    u[k] = np.clip(u_raw, -torque_max, torque_max)
-    error_prev = e[k]
+        Kp = 0.0
 
-    d_delta = ((u[k] * 0.035) - delta[k]) / tau_act
-    delta[k + 1] = delta[k] + d_delta * dt
+        if abs(e_k) <= 0.08:
+            Kp = Kp1
+        elif abs(e_k) <= 0.15:
+            Kp = Kp2
+        else:
+            Kp = Kp3
 
-    d_psi = (vx / L_wb) * delta[k]
-    psi[k + 1] = psi[k] + d_psi * dt
+        integral_e += e_k * dt
+        derivada_e = (e_k - error_prev) / dt
+        u_raw = Kp * e_k + Ki * integral_e + Kd * derivada_e
 
-    dy = vx * psi[k] + perturbacion[k] * dt * 10.0
-    y[k + 1] = y[k] + dy * dt
+        u_k = float(np.clip(u_raw, -torque_max, torque_max))
+        error_prev = e_k
 
-e[-1] = e[-2]
-u[-1] = u[-2]
+    t_buf.append(t_k)
+    y_buf.append(y_k)
+    e_buf.append(e_k)
+    u_buf.append(u_k)
+    p_buf.append(p_k)
+
+    desvio_max = max(desvio_max, abs(y_k))
+    torque_pico = max(torque_pico, abs(u_k))
+
+    # Integración por Euler hacia k + 1
+    d_delta = ((u_k * 0.035) - delta_k) / tau_act
+    delta_next = delta_k + d_delta * dt
+
+    d_psi = (vx / L_wb) * delta_k
+    psi_next = psi_k + d_psi * dt
+
+    dy = vx * psi_k + p_k * dt * 10.0
+    y_next = y_k + dy * dt
+
+    y_k = y_next
+    psi_k = psi_next
+    delta_k = delta_next
+    y_delay_buf.append(y_next)
+    k_step += 1
+
 
 # --- ENCABEZADO PRINCIPAL COMPACTO ---
 st.markdown("""
@@ -349,23 +389,19 @@ metrics_placeholder = st.empty()
 plot_placeholder = st.empty()
 
 
-def render_metrics(idx_end: int):
-    y_seg = y[:idx_end]
-    e_seg = e[:idx_end]
-    u_seg = u[:idx_end]
-    t_actual = t[idx_end - 1]
-
-    desvio_max = float(np.max(np.abs(y_seg)))
-    ess_actual = float(np.abs(e_seg[-1]))
-    torque_pico = float(np.max(np.abs(u_seg)))
+def render_metrics(es_final_finito: bool = False):
+    t_actual = t_buf[-1]
+    ess_actual = abs(e_buf[-1])
     en_carril = desvio_max < 0.30
 
-    if len(y_seg) > 1:
-        variacion_final = float(np.max(np.abs(np.diff(y_seg[-min(50, len(y_seg)):]))))
+    if len(y_buf) > 1:
+        y_reciente = list(y_buf)[-min(50, len(y_buf)):]
+        variacion_final = float(np.max(np.abs(np.diff(y_reciente))))
     else:
         variacion_final = float("inf")
 
-    if idx_end == n and variacion_final < 0.0005:
+    estabilizado = (len(y_buf) >= 50 and variacion_final < 0.0005)
+    if (simulacion_infinita and estabilizado) or (es_final_finito and variacion_final < 0.0005):
         titulo_error = "Error Estado Estable (ess)"
         delta_error = f"Estabilizado en t = {t_actual:.1f} s"
     else:
@@ -406,17 +442,17 @@ def render_metrics(idx_end: int):
     )
 
 
-# --- CONFIGURACIÓN BASE DE GRÁFICAS (ejes fijos para evolución suave) ---
+# --- CONFIGURACIÓN BASE DE GRÁFICAS ---
 fig, axs = plt.subplots(3, 1, figsize=(11, alto_fig), sharex=True)
 
-y_lim = max(0.36, float(np.max(np.abs(y))) * 1.15)
-e_lim = max(0.15, float(np.max(np.abs(e))) * 1.15)
-u_lim = max(0.6, float(np.max(np.abs(np.concatenate([u, perturbacion])))) * 1.15)
+y_lim = 0.36
+e_lim = 0.15
+u_lim = 0.60
 
 # 1. Posición Lateral
 (line_y,) = axs[0].plot([], [], label=r'Posición real $\theta_o(t)$ [m]', color='#1f77b4', linewidth=1.7)
 (dot_y,) = axs[0].plot([], [], 'o', color='#1f77b4', markersize=5)
-axs[0].plot(t, r, '--', label=r'Referencia $\theta_i(t) = 0$ m', color='black', linewidth=1.0)
+axs[0].axhline(0.0, linestyle='--', label=r'Referencia $\theta_i(t) = 0$ m', color='black', linewidth=1.0)
 axs[0].axhspan(-banda_muerta, banda_muerta, color='green', alpha=0.15, label=f'Banda nominal (±{banda_muerta:.2f} m)')
 axs[0].axhline(0.30, color='red', linestyle=':', linewidth=1.1, label='Límite carril (±0.30 m)')
 axs[0].axhline(-0.30, color='red', linestyle=':', linewidth=1.1)
@@ -447,7 +483,7 @@ axs[2].set_xlabel('Tiempo [s]', fontsize=8.5, fontweight='bold')
 axs[2].tick_params(labelsize=8)
 axs[2].grid(True, alpha=0.35, linestyle='--')
 
-# Referencias visuales y marcas en el eje X para t_inicio y t_fin
+# Referencias visuales para t_inicio y t_fin
 refs_tiempo = [t_inicio] if es_peralte else [t_inicio, t_fin]
 for ax in axs:
     ax.axvline(t_inicio, color='#ff7f0e', linestyle=':', linewidth=0.9, alpha=0.55)
@@ -460,16 +496,23 @@ elif T_total <= 20.0:
     tick_step = 2.0
 else:
     tick_step = 5.0
-base_ticks = list(np.arange(0.0, T_total + 1e-9, tick_step))
-min_gap = T_total * 0.035
-valid_refs = [float(rv) for rv in refs_tiempo if 0.0 <= rv <= T_total]
-x_ticks = [bt for bt in base_ticks if all(abs(bt - rv) >= min_gap for rv in valid_refs)]
-for rv in valid_refs:
-    if all(abs(rv - tv) >= 1e-6 for tv in x_ticks):
-        x_ticks.append(rv)
-x_ticks.sort()
-axs[2].set_xticks(x_ticks)
-axs[2].set_xticklabels([f"{tv:g}" for tv in x_ticks])
+
+
+def actualizar_xticks(x_min: float, x_max: float):
+    inicio_tick = np.ceil(x_min / tick_step) * tick_step
+    base_ticks = list(np.arange(inicio_tick, x_max + 1e-9, tick_step))
+    min_gap = (x_max - x_min) * 0.035
+    valid_refs = [float(rv) for rv in refs_tiempo if x_min <= rv <= x_max]
+    x_ticks = [bt for bt in base_ticks if all(abs(bt - rv) >= min_gap for rv in valid_refs)]
+    for rv in valid_refs:
+        if all(abs(rv - tv) >= 1e-6 for tv in x_ticks):
+            x_ticks.append(rv)
+    x_ticks.sort()
+    axs[2].set_xticks(x_ticks)
+    axs[2].set_xticklabels([f"{tv:g}" for tv in x_ticks])
+
+
+actualizar_xticks(0.0, T_total)
 
 # Configuración de referencias (leyendas) para no tapar los datos
 if pos_leyenda == "Exterior derecha (no tapa gráficos)":
@@ -486,18 +529,45 @@ else:
     plt.subplots_adjust(left=0.07, right=0.98, top=0.96, bottom=0.11, hspace=0.18)
 
 
-def render_frame(idx_end: int, mostrar_cursor: bool):
-    t_seg = t[:idx_end]
-    line_y.set_data(t_seg, y[:idx_end])
-    line_e.set_data(t_seg, e[:idx_end])
-    line_u.set_data(t_seg, u[:idx_end])
-    line_p.set_data(t_seg, perturbacion[:idx_end])
+def render_frame(mostrar_cursor: bool, es_final_finito: bool = False):
+    global y_lim, e_lim, u_lim
+
+    t_arr = list(t_buf)
+    y_arr = list(y_buf)
+    e_arr = list(e_buf)
+    u_arr = list(u_buf)
+    p_arr = list(p_buf)
+
+    line_y.set_data(t_arr, y_arr)
+    line_e.set_data(t_arr, e_arr)
+    line_u.set_data(t_arr, u_arr)
+    line_p.set_data(t_arr, p_arr)
+
+    # Avanzar la ventana del eje X cuando la simulación supera T_total
+    t_cur = t_arr[-1]
+    x_min = max(0.0, t_cur - T_total)
+    x_max = max(T_total, t_cur)
+    axs[0].set_xlim(x_min, x_max)
+    actualizar_xticks(x_min, x_max)
+
+    # Ampliar dinámicamente los límites verticales si algún pico supera la escala actual
+    y_req = max(0.36, max(abs(v) for v in y_arr) * 1.15)
+    e_req = max(0.15, max(abs(v) for v in e_arr) * 1.15)
+    u_req = max(0.60, max(max(abs(v) for v in u_arr), max(abs(v) for v in p_arr)) * 1.15)
+    if y_req > y_lim:
+        y_lim = y_req
+        axs[0].set_ylim(-y_lim, y_lim)
+    if e_req > e_lim:
+        e_lim = e_req
+        axs[1].set_ylim(-e_lim, e_lim)
+    if u_req > u_lim:
+        u_lim = u_req
+        axs[2].set_ylim(-u_lim, u_lim)
 
     if mostrar_cursor:
-        t_cur = t[idx_end - 1]
-        dot_y.set_data([t_cur], [y[idx_end - 1]])
-        dot_e.set_data([t_cur], [e[idx_end - 1]])
-        dot_u.set_data([t_cur], [u[idx_end - 1]])
+        dot_y.set_data([t_cur], [y_arr[-1]])
+        dot_e.set_data([t_cur], [e_arr[-1]])
+        dot_u.set_data([t_cur], [u_arr[-1]])
         vline_0.set_xdata([t_cur, t_cur])
         vline_1.set_xdata([t_cur, t_cur])
         vline_2.set_xdata([t_cur, t_cur])
@@ -512,32 +582,43 @@ def render_frame(idx_end: int, mostrar_cursor: bool):
         vline_1.set_visible(False)
         vline_2.set_visible(False)
 
-    render_metrics(idx_end)
+    render_metrics(es_final_finito=es_final_finito)
     try:
         plot_placeholder.pyplot(fig, width="stretch")
     except TypeError:
         plot_placeholder.pyplot(fig, use_container_width=True)
 
 
-if animar_evolucion:
-    config_vel = {
-        "Muy lenta": (50, 0.18),
-        "Lenta": (40, 0.10),
-        "Normal": (28, 0.04),
-        "Rápida": (20, 0.01),
-    }
-    num_frames, pausa_seg = config_vel[velocidad_anim]
-    paso_muestras = max(1, n // num_frames)
-    frames = list(range(paso_muestras, n, paso_muestras))
-    if not frames or frames[-1] != n:
-        frames.append(n)
+config_vel = {
+    "Muy lenta": (20, 0.18),
+    "Lenta": (25, 0.10),
+    "Normal": (35, 0.04),
+    "Rápida": (50, 0.01),
+}
+paso_muestras, pausa_seg = config_vel[velocidad_anim]
 
-    for idx in frames:
-        es_final = (idx == n)
-        render_frame(idx, mostrar_cursor=not es_final)
+if simulacion_infinita:
+    while True:
+        for _ in range(paso_muestras):
+            avanzar_paso()
+        render_frame(mostrar_cursor=True)
+        time.sleep(pausa_seg)
+elif animar_evolucion:
+    n_total = int(round(T_total / dt))
+    pasos_restantes = n_total
+    while pasos_restantes > 0:
+        pasos_este_cuadro = min(paso_muestras, pasos_restantes)
+        for _ in range(pasos_este_cuadro):
+            avanzar_paso()
+        pasos_restantes -= pasos_este_cuadro
+        es_final = (pasos_restantes == 0)
+        render_frame(mostrar_cursor=not es_final, es_final_finito=es_final)
         if not es_final:
             time.sleep(pausa_seg)
 else:
-    render_frame(n, mostrar_cursor=False)
+    n_total = int(round(T_total / dt))
+    for _ in range(n_total):
+        avanzar_paso()
+    render_frame(mostrar_cursor=False, es_final_finito=True)
 
 plt.close(fig)

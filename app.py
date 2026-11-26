@@ -146,7 +146,9 @@ VALORES_CASO_1 = {
     "slider_pert": 0.45,
     "t_inicio": 2.0,
     "t_fin": 5.0,
-    "Kp1": 0.0,
+    "dt_d": 0.01,
+    "dt_i": 0.03,
+    "Kp1": 0.25,
     "Kp2": 1.8,
     "Kp3": 2.6,
     "Ki": 0.25,
@@ -175,9 +177,15 @@ def crear_estado_simulacion() -> dict:
         "psi_k": 0.0,
         "delta_k": 0.0,
         "integral_e": 0.0,
-        "error_prev": 0.0,
+        "error_prev_d": 0.0,
         "desvio_max": 0.0,
         "torque_pico": 0.0,
+        "termino_i": 0.0,
+        "termino_d": 0.0,
+        "t_ultimo_i": 0.0,
+        "t_ultimo_d": 0.0,
+        "cont_i": 0.0,
+        "cont_d": 0.0,
         "y_delay_buf": deque([0.0] * (delay_steps + 1), maxlen=delay_steps + 1),
         "rng_asfalto": np.random.default_rng(42),
         "t": [],
@@ -280,8 +288,8 @@ amp_pert = st.sidebar.number_input(
 )
 amp_slider = st.sidebar.slider(
     "Ajuste rápido intensidad",
-    min_value=-1.5,
-    max_value=1.5,
+    min_value=-3.0,
+    max_value=3.0,
     step=0.05,
     key="slider_pert",
     on_change=sync_slider_to_num
@@ -309,6 +317,10 @@ Kp2 = st.sidebar.number_input("Kp Moderado [Nm/m]", min_value=0.0, max_value=20.
 Kp3 = st.sidebar.number_input("Kp Intenso [Nm/m]", min_value=0.0, max_value=20.0, step=0.1, key="Kp3")
 Ki = st.sidebar.number_input("Ki [Nm/(m·s)]", min_value=0.0, max_value=10.0, step=0.05, key="Ki")
 Kd = st.sidebar.number_input("Kd [Nm·s/m]", min_value=0.0, max_value=10.0, step=0.1, key="Kd")
+
+col_dt1, col_dt2 = st.sidebar.columns(2)
+dt_i = col_dt1.number_input("dt Integral [s]", min_value=0.01, max_value=1.0, step=0.01, format="%.2f", key="dt_i")
+dt_d = col_dt2.number_input("dt Derivativo [s]", min_value=0.01, max_value=1.0, step=0.01, format="%.2f", key="dt_d")
 
 st.sidebar.subheader("Restricciones y Horizonte Temporal")
 banda_muerta = st.sidebar.number_input(
@@ -372,7 +384,7 @@ pos_leyenda = st.sidebar.selectbox(
 # --- DETECCIÓN DE CAMBIO DE PARÁMETROS FÍSICOS ---
 firma_params = (
     vx_kmh, tipo_pert, amp_pert, t_inicio, t_fin,
-    Kp1, Kp2, Kp3, Ki, Kd, banda_muerta, simulacion_infinita
+    Kp1, Kp2, Kp3, Ki, Kd, banda_muerta, dt_d, dt_i, simulacion_infinita
 )
 if "firma_params" not in st.session_state:
     st.session_state["firma_params"] = firma_params
@@ -433,7 +445,7 @@ def avanzar_paso():
         u_k = 0.0
     else:
         y_medido = sim["y_delay_buf"][0]
-        e_k = 0.0 - y_medido  # Referencia r(t) = 0.0 m
+        e_k = 0.0 - y_medido  
 
         if abs(e_k) <= banda_muerta:
             Kp = Kp1
@@ -442,14 +454,26 @@ def avanzar_paso():
         else:
             Kp = Kp3
 
-        sim["integral_e"] += e_k * dt
-        derivada_e = (e_k - sim["error_prev"]) / dt
-        u_raw = Kp * e_k + Ki * sim["integral_e"] + Kd * derivada_e
+        # --- Acción Integral cada dt_i ---
+        dt_real_i = t_k - sim["t_ultimo_i"]
+        if dt_real_i >= (dt_i - 1e-9):
+            sim["integral_e"] += e_k * dt_real_i
+            sim["termino_i"] = Ki * sim["integral_e"]
+            sim["t_ultimo_i"] = t_k
+
+        # --- Acción Derivativa cada dt_d ---
+        dt_real_d = t_k - sim["t_ultimo_d"]
+        if dt_real_d >= (dt_d - 1e-9):
+            derivada_e = (e_k - sim["error_prev_d"]) / dt_real_d
+            sim["termino_d"] = Kd * derivada_e
+            sim["error_prev_d"] = e_k
+            sim["t_ultimo_d"] = t_k
+
+        u_raw = (Kp * e_k) + sim["termino_i"] + sim["termino_d"]
 
         u_k = float(np.clip(u_raw, -torque_max, torque_max))
         sim["error_prev"] = e_k
 
-    # Detección de hito: desvío real por la perturbación y primer alcance/cruce por 0
     if t_k >= t_inicio and abs(y_k) >= 0.005:
         sim["hubo_desvio"] = True
 
@@ -468,7 +492,6 @@ def avanzar_paso():
     sim["desvio_max"] = max(sim["desvio_max"], abs(y_k))
     sim["torque_pico"] = max(sim["torque_pico"], abs(u_k))
 
-    # Detección de flag de Estado Estable (ess) tras la perturbación
     if sim["flag_ss_t"] is None and t_k >= t_min_ss and len(sim["y"]) >= 50:
         y_rec = sim["y"][-50:]
         var_paso = float(np.max(np.abs(np.diff(y_rec))))
@@ -477,7 +500,6 @@ def avanzar_paso():
             sim["flag_ss_t"] = t_k
             sim["flag_ss_err"] = abs(e_k)
 
-    # Integración por Euler hacia k + 1
     d_delta = ((u_k * 0.035) - delta_k) / tau_act
     delta_next = delta_k + d_delta * dt
 

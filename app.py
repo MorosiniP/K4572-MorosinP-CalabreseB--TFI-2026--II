@@ -136,6 +136,7 @@ TIPOS_PERTURBACION = [
     "Peralte o pendiente transversal de la calzada",
     "Irregularidades del asfalto",
     "Intervención del conductor",
+    "Viento Acelerado"
 ]
 
 # --- VALORES NOMINALES POR DEFECTO (CASO 1) ---
@@ -273,14 +274,14 @@ descripciones_pert = {
     "Peralte o pendiente transversal de la calzada": "Inclinación lateral constante (escalón) a partir de t inicio.",
     "Irregularidades del asfalto": "Baches y ondulaciones de la calzada con vibraciones entre t inicio y t fin.",
     "Intervención del conductor": "Empuje o maniobra externa en el volante (impulso suave) entre t inicio y t fin.",
+    "Viento Acelerado": "Ráfaga lateral (parábola) entre t inicio y t fin.",
 }
 st.sidebar.caption(descripciones_pert[tipo_pert])
 
 # Entrada numérica exacta + slider sincronizados
 amp_pert = st.sidebar.number_input(
     "Intensidad de perturbación (teclado)",
-    min_value=-3.0,
-    max_value=3.0,
+    
     step=0.05,
     format="%.3f",
     key="amp_pert",
@@ -425,6 +426,9 @@ def calcular_perturbacion(t_actual: float) -> float:
             tm = t_actual - t_inicio
             return amp_pert * 1.25 * float(np.sin(np.pi * tm / dur_pert))
         return 0.0
+    if tipo_pert == "Viento Acelerado":
+        tm = t_actual - t_inicio
+        return 0.15 * amp_pert * (tm ** 2)
     return 0.0
 
 
@@ -472,7 +476,6 @@ def avanzar_paso():
         u_raw = (Kp * e_k) + sim["termino_i"] + sim["termino_d"]
 
         u_k = float(np.clip(u_raw, -torque_max, torque_max))
-        sim["error_prev"] = e_k
 
     if t_k >= t_inicio and abs(y_k) >= 0.005:
         sim["hubo_desvio"] = True
